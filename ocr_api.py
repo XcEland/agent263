@@ -1,5 +1,6 @@
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from mistralai import Mistral
 import google.generativeai as genai
 import os
@@ -8,7 +9,8 @@ import uvicorn
 from dotenv import load_dotenv
 import json
 import re
-from typing import List, Dict, Any
+import httpx
+from typing import List, Dict, Any, Optional
 
 # Load environment variables
 load_dotenv()
@@ -252,8 +254,8 @@ VALID_CATEGORIES = [
     "Application Form"
 ]
 
-def process_file(file: UploadFile, content_type: str) -> str:
-    """Process file through Mistral OCR API"""
+def process_file(file: UploadFile, content_type: str) -> tuple:
+    """Process file through Mistral OCR API and return (markdown, file_id, file_url)"""
     try:
         # Save uploaded file to temp location
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
@@ -271,8 +273,12 @@ def process_file(file: UploadFile, content_type: str) -> str:
                 purpose="ocr"
             )
         
-        # Get signed URL
-        file_url = client.files.get_signed_url(file_id=uploaded_file.id)
+        # Store file ID for response
+        file_id = uploaded_file.id
+        
+        # Get signed URL - NEW: Capture file URL
+        file_url_obj = client.files.get_signed_url(file_id=file_id)
+        file_url = file_url_obj.url
         
         # Determine document type
         if content_type == "application/pdf":
@@ -287,7 +293,7 @@ def process_file(file: UploadFile, content_type: str) -> str:
             model="mistral-ocr-latest",
             document={
                 "type": doc_type,
-                doc_type: file_url.url
+                doc_type: file_url  # Use the signed URL
             },
             include_image_base64=False
         )
@@ -296,14 +302,16 @@ def process_file(file: UploadFile, content_type: str) -> str:
         os.unlink(tmp_path)
         
         # Combine markdown from all pages
-        return "\n\n".join([page.markdown for page in response.pages])
+        markdown_content = "\n\n".join([page.markdown for page in response.pages])
+        
+        return markdown_content, file_id, file_url  # Return file URL
     
     except Exception as e:
         # Clean up temp file if exists
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
-
+    
 def verify_document_category(category: str, markdown_content: str) -> dict:
     """Verify if document content matches the specified category"""
     try:
@@ -396,8 +404,8 @@ async def unified_ocr(
         )
     
     try:
-        # Process file through OCR
-        markdown_content = process_file(file, file.content_type)
+        # Process file through OCR - now returns file_url
+        markdown_content, file_id, file_url = process_file(file, file.content_type)
         
         # Verify document category
         verification = verify_document_category(category, markdown_content)
@@ -409,11 +417,14 @@ async def unified_ocr(
             "ocr_type": "document" if file.content_type == "application/pdf" else "image",
             "markdown": markdown_content,
             "pages": markdown_content.count('\n\n') + 1,  # Estimate page count
-            "verification": verification
+            "verification": verification,
+            "file_id": file_id,
+            "file_url": file_url,  # Direct access URL
+            "view_url": f"/file-view/{file_id}"  # Safe viewing URL
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # Separate endpoints for backward compatibility
 @app.post("/ocr/document")
 async def ocr_document(
@@ -434,6 +445,201 @@ async def ocr_image(
     if file.content_type not in ["image/jpeg", "image/png"]:
         raise HTTPException(status_code=400, detail="Only JPEG/PNG images are supported")
     return await unified_ocr(category, file)
+
+@app.get("/documents/{file_id}")
+async def get_document(
+    file_id: str, 
+    download: Optional[bool] = False
+):
+    """
+    Access a document stored on Mistral by its file ID
+    
+    Parameters:
+    - file_id: Mistral file identifier
+    - download: Set to true to download content instead of redirecting
+    
+    Returns:
+    - Redirect to signed URL (default)
+    - File content if download=true
+    """
+    try:
+        # Get signed URL from Mistral
+        file_url = client.files.get_signed_url(file_id=file_id)
+        
+        if download:
+            # Download file content
+            async with httpx.AsyncClient() as http_client:
+                response = await http_client.get(file_url.url)
+                response.raise_for_status()
+                
+                return JSONResponse(
+                    content={
+                        "file_id": file_id,
+                        "content": response.text,
+                        "content_type": response.headers.get("Content-Type", "application/octet-stream")
+                    }
+                )
+        else:
+            # Redirect to signed URL
+            return RedirectResponse(url=file_url.url)
+            
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found or inaccessible: {str(e)}"
+        )
+
+@app.get("/documents/{file_id}/info")
+async def get_document_info(file_id: str):
+    """
+    Get metadata about a document stored on Mistral
+    
+    Parameters:
+    - file_id: Mistral file identifier
+    
+    Returns:
+    - Document metadata
+    """
+    try:
+        # Retrieve file information
+        file_info = client.files.retrieve(file_id=file_id)
+        
+        # Convert created_at to ISO format
+        created_at = file_info.created_at
+        if isinstance(created_at, int):
+            created_at = datetime.utcfromtimestamp(created_at).isoformat() + "Z"
+        elif hasattr(created_at, "isoformat"):
+            created_at = created_at.isoformat()
+        else:
+            created_at = str(created_at)
+        
+        # Build response with safe attribute access
+        return JSONResponse(content={
+            "file_id": file_info.id,
+            "filename": file_info.filename,
+            "purpose": file_info.purpose,
+            "created_at": created_at,
+            "object": file_info.object,
+            # "status": file_info.status,
+            "status_details": getattr(file_info, "status_details", None),
+            # Size information might not be available in all API versions
+            "size_bytes": getattr(file_info, "bytes", None),
+        })
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {str(e)}"
+        )
+
+@app.post("/upload-file")
+async def upload_file(
+    file: UploadFile = File(..., description="File to upload (PDF, JPEG, PNG)")
+):
+    """
+    Upload a file to Mistral and return file metadata
+    
+    Supports:
+    - PDF documents (application/pdf)
+    - JPEG images (image/jpeg)
+    - PNG images (image/png)
+    
+    Returns:
+    - file_id: Mistral's file identifier
+    - file_url: Temporary signed URL for direct access
+    - view_url: URL for browser viewing
+    - content_type: Detected file type
+    - filename: Original filename
+    """
+    # Validate content type
+    valid_types = ["application/pdf", "image/jpeg", "image/png"]
+    if file.content_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Supported types: {', '.join(valid_types)}"
+        )
+    
+    try:
+        # Save uploaded file to temp location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+            content = file.file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+        
+        # Upload to Mistral
+        with open(tmp_path, "rb") as f:
+            uploaded_file = client.files.upload(
+                file={
+                    "fileName": file.filename,
+                    "content": f.read()
+                },
+                purpose="ocr"
+            )
+        
+        # Get file metadata
+        file_id = uploaded_file.id
+        
+        # Get signed URL
+        file_url_obj = client.files.get_signed_url(file_id=file_id)
+        file_url = file_url_obj.url
+        
+        # Clean up temp file
+        os.unlink(tmp_path)
+        
+        return JSONResponse(content={
+            "file_id": file_id,
+            "file_url": file_url,
+            "view_url": f"/file-view/{file_id}",
+            "content_type": file.content_type,
+            "filename": file.filename
+        })
+    
+    except Exception as e:
+        # Clean up temp file if exists
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"File upload failed: {str(e)}"
+        )
+       
+@app.get("/file-view/{file_id}")
+async def view_file(file_id: str):
+    """
+    View a file in the browser without downloading
+    
+    Parameters:
+    - file_id: Mistral file identifier
+    
+    Returns:
+    - File content with inline Content-Disposition
+    """
+    try:
+        # Get signed URL from Mistral
+        file_url = client.files.get_signed_url(file_id=file_id)
+        
+        async with httpx.AsyncClient() as http_client:
+            # Fetch file headers to determine content type
+            head_response = await http_client.head(file_url.url)
+            head_response.raise_for_status()
+            
+            content_type = head_response.headers.get("Content-Type", "application/octet-stream")
+            
+            # Fetch actual content
+            response = await http_client.get(file_url.url)
+            response.raise_for_status()
+            
+            # Return with inline content disposition
+            return Response(
+                content=response.content,
+                media_type=content_type,
+                headers={"Content-Disposition": "inline"}
+            )
+            
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"File access failed: {str(e)}"
+        )
 
 if __name__ == "__main__":
     uvicorn.run("ocr_api:app", host="0.0.0.0", port=8000, reload=True)
