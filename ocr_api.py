@@ -1,12 +1,14 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.responses import JSONResponse
 from mistralai import Mistral
+import google.generativeai as genai
 import os
 import tempfile
 import uvicorn
 from dotenv import load_dotenv
 import json
 import re
+from typing import List, Dict, Any
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +24,224 @@ api_key = os.getenv("MISTRAL_API_KEY")
 if not api_key:
     raise RuntimeError("MISTRAL_API_KEY environment variable not set")
 client = Mistral(api_key=api_key)
+
+# Initialize Google Gemini client for verification
+google_api_key = os.getenv("GOOGLE_API_KEY")
+if not google_api_key:
+    raise RuntimeError("GOOGLE_API_KEY environment variable not set")
+genai.configure(api_key=google_api_key)
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')   
+
+# Field mapping instructions for the AI
+FIELD_INSTRUCTIONS = {
+    "personalDetails": {
+        "countryOfBirth": "Look in Proof of Identity document (National ID) for country of birth",
+        "citizenship": "Infer from countryOfBirth if not found (ZIMBABWE → ZIMBABWEAN)",
+        "identificationType": "Determine from document type (NATIONAL ID or PASSPORT)",
+        "idNumber": "Search all documents for ID number (especially Proof of Identity)",
+        "dateOfBirth": "Search all documents for date of birth (format: YYYY-MM-DD)",
+        "gender": "Infer from title if possible (MR/SIR → Male, MRS/MS → Female)",
+        "title": "Search all documents for title (MR, MRS, MS, etc.)",
+        "firstname": "Search all documents for first name",
+        "lastname": "Search all documents for last name",
+        "maritalStatus": "Only include if explicitly found (SINGLE, MARRIED, etc.)",
+        "religion": "Only include if explicitly found",
+        "race": "Only include if explicitly found",
+        "numberOfDependents": "Only include if explicitly found",
+        "highestLevelOfEducation": "Only include if explicitly found",
+        "birthDistrict": "Search Proof of Identity for birth district"
+    },
+    "contactDetails": {
+        "primaryMethodOfCommunication": "Only include if explicitly found",
+        "email": "Search all documents for email address",
+        "phoneNumber": "Search all documents for phone number",
+        "telephoneNumber": "Search all documents for telephone number",
+        "facebook": "Only include if explicitly found",
+        "twitter": "Only include if explicitly found",
+        "linkedin": "Only include if explicitly found",
+        "skype": "Only include if explicitly found"
+    },
+    "addressDetails": {
+        "addressType": "Default to RESIDENTIAL if found in Proof of Residence",
+        "addressLine": "Extract from Proof of Residence",
+        "street": "Extract from Proof of Residence",
+        "suburb": "Extract from Proof of Residence",
+        "city": "Extract from Proof of Residence",
+        "country": "Infer from Proof of Identity if not found",
+        "postalCode": "Only include if explicitly found",
+        "periodOfResidenceInYears": "Only include if explicitly found",
+        "periodOfResidenceInMonths": "Only include if explicitly found",
+        "monthlyRentalAmount": "Only include if explicitly found",
+        "homeOwnership": "Only include if explicitly found"
+    },
+    "employmentDetails": {
+        "employerName": "Extract from Employment Letter",
+        "phoneNumber": "Extract from Employment Letter",
+        "telephoneNumber": "Extract from Employment Letter",
+        "email": "Extract from Employment Letter",
+        "address": "Extract from Employment Letter",
+        "jobTitle": "Extract from Employment Letter",
+        "industry": "Extract from Employment Letter",
+        "monthlyGrossIncome": "Only include if explicitly found",
+        "monthlyNetIncome": "Only include if explicitly found",
+        "employmentType": "Only include if explicitly found",
+        "employmentDate": "Only include if explicitly found (format: YYYY-MM-DD)",
+        "employmentEndDate": "Only include if explicitly found (format: YYYY-MM-DD)",
+        "sourceOfFunds": "Extract from Employment Letter or Proof of Income"
+    }
+}
+
+def extract_details_from_documents(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract applicant details from document markdown using Google Gemini"""
+    try:
+        # Prepare document context
+        document_context = "\n\n".join([
+            f"DOCUMENT CATEGORY: {doc['category']}\nCONTENT:\n{doc['markdown'][:10000]}"
+            for doc in documents
+        ])
+        
+        # Create extraction prompt
+        prompt = f"""
+        ROLE: You are a bank branch consultant responsible for extracting applicant details from onboarding documents.
+        TASK: Analyze the document content below and extract relevant information to populate the JSON structure.
+        
+        INSTRUCTIONS:
+        1. BE STRICT: Only extract values that are EXPLICITLY stated in the documents. Do not guess or assume values.
+        2. COMPARE DOCUMENTS: When the same field appears in multiple documents, verify consistency. If values conflict, use the value from the most authoritative document (Proof of Identity > Employment Letter > Proof of Residence).
+        3. INFER ONLY WHEN LOGICAL: 
+           - If countryOfBirth is "ZIMBABWE", set citizenship to "ZIMBABWEAN"
+           - Map titles to gender: MR/SIR → Male, MRS/MS → Female
+        4. FORMATTING:
+           - All string values MUST BE IN UPPERCASE
+           - Dates must be in YYYY-MM-DD format
+           - Numbers should be in numerical format (not words)
+        5. MISSING DATA: Leave fields blank if information is not found in any document.
+        6. STRUCTURE: Return ONLY a JSON object with the exact structure specified below.
+        
+        DOCUMENT CONTENT:
+        {document_context}
+        
+        FIELD MAPPING INSTRUCTIONS:
+        {json.dumps(FIELD_INSTRUCTIONS, indent=2)}
+        
+        REQUIRED JSON STRUCTURE:
+        {{
+            "personalDetails": {{
+                "countryOfBirth": "",
+                "citizenship": "",
+                "identificationType": "",
+                "idNumber": "",
+                "dateOfBirth": "",
+                "gender": "",
+                "title": "",
+                "firstname": "",
+                "lastname": "",
+                "maritalStatus": "",
+                "religion": "",
+                "race": "",
+                "numberOfDependents": 0,
+                "highestLevelOfEducation": "",
+                "birthDistrict": ""
+            }},
+            "contactDetails": {{
+                "primaryMethodOfCommunication": "",
+                "email": "",
+                "phoneNumber": "",
+                "telephoneNumber": "",
+                "facebook": "",
+                "twitter": "",
+                "linkedin": "",
+                "skype": ""
+            }},
+            "addressDetails": [
+                {{
+                    "addressType": "",
+                    "addressLine": "",
+                    "street": "",
+                    "suburb": "",
+                    "city": "",
+                    "country": "",
+                    "postalCode": "",
+                    "periodOfResidenceInYears": "0",
+                    "periodOfResidenceInMonths": "0",
+                    "monthlyRentalAmount": "0",
+                    "homeOwnership": ""
+                }}
+            ],
+            "employmentDetails": {{
+                "employerName": "",
+                "phoneNumber": "",
+                "telephoneNumber": "",
+                "email": "",
+                "address": "",
+                "jobTitle": "",
+                "industry": "",
+                "monthlyGrossIncome": 0.0,
+                "monthlyNetIncome": 0.0,
+                "employmentType": "",
+                "employmentDate": "",
+                "employmentEndDate": "",
+                "sourceOfFunds": [
+                    {{
+                        "source": "",
+                        "currency": "",
+                        "amount": 0.0
+                    }}
+                ]
+            }}
+        }}
+        """
+        
+        # Get extraction from Gemini
+        response = gemini_model.generate_content(prompt)
+        
+        # Extract JSON from response
+        json_match = re.search(r'\{[\s\S]*\}', response.text)
+        if not json_match:
+            raise ValueError("No JSON found in Gemini response")
+        
+        extracted_data = json.loads(json_match.group())
+        
+        # Validate response structure
+        required_sections = ["personalDetails", "contactDetails", 
+                            "addressDetails", "employmentDetails"]
+        if not all(section in extracted_data for section in required_sections):
+            raise ValueError("Invalid extraction response format")
+            
+        return extracted_data
+        
+    except Exception as e:
+        raise RuntimeError(f"Extraction failed: {str(e)}")
+
+@app.post("/extract-details")
+async def extract_details(
+    documents: List[Dict[str, Any]] = Body(..., description="List of OCR-processed documents")
+):
+    """
+    Extract applicant details from OCR-processed documents
+    
+    Request Body:
+    [
+        {
+            "category": "Proof of Identity",
+            "markdown": "...",
+            ... (other fields optional)
+        },
+        ...
+    ]
+    """
+    try:
+        # Validate input
+        if not documents or not isinstance(documents, list):
+            raise HTTPException(status_code=400, detail="Invalid documents format")
+            
+        # Extract details using AI
+        extracted_data = extract_details_from_documents(documents)
+        
+        return JSONResponse(content=extracted_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+ 
 
 # Define valid categories
 VALID_CATEGORIES = [

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.responses import JSONResponse
 from mistralai import Mistral
 import google.generativeai as genai
@@ -15,7 +15,7 @@ load_dotenv()
 app = FastAPI(
     title="Document Verification API",
     description="OCR processing with Mistral and document verification with Google Gemini",
-    version="3.0.0"
+    version="1.0.1"
 )
 
 # Initialize Mistral client for OCR
@@ -29,8 +29,7 @@ google_api_key = os.getenv("GOOGLE_API_KEY")
 if not google_api_key:
     raise RuntimeError("GOOGLE_API_KEY environment variable not set")
 genai.configure(api_key=google_api_key)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-
+gemini_model = genai.GenerativeModel('gemini-1.5-flash')   
 # Define valid categories
 VALID_CATEGORIES = [
     "Proof of Identity",
