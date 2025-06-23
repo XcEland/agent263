@@ -1,6 +1,7 @@
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from mistralai import Mistral
 import google.generativeai as genai
 import os
@@ -19,6 +20,15 @@ app = FastAPI(
     title="Mistral OCR API",
     description="Unified API for document OCR, image OCR, and document verification",
     version="3.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins in development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Initialize Mistral client
@@ -215,7 +225,7 @@ def extract_details_from_documents(documents: List[Dict[str, Any]]) -> Dict[str,
     except Exception as e:
         raise RuntimeError(f"Extraction failed: {str(e)}")
 
-@app.post("/extract-details")
+@app.post("/api/v1/agents/documents/extract-details")
 async def extract_details(
     documents: List[Dict[str, Any]] = Body(..., description="List of OCR-processed documents")
 ):
@@ -312,37 +322,100 @@ def process_file(file: UploadFile, content_type: str) -> tuple:
             os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
     
+# def verify_document_category(category: str, markdown_content: str) -> dict:
+#     """Verify if document content matches the specified category"""
+#     try:
+#         # Truncate content to fit within token limits
+#         truncated_content = markdown_content[:15000]  # Keep first 15k characters
+        
+#         # Create verification prompt
+#         prompt = f"""
+#         You are a bank branch consultant responsible for verifying that the provided document 
+#         matches the specified category. Analyze the document content and determine if it contains
+#         the required information for the category.
+        
+#         Category: {category}
+#         Document Content:
+#         {truncated_content}
+        
+#         Your verification should be strict. Only return a JSON response with these keys:
+#         - "verified": boolean (true only if document clearly matches the category)
+#         - "confidence": integer (0-100, confidence level in verification)
+#         - "reason": string (brief explanation of your decision)
+        
+#         Category Requirements:
+#         - "Proof of Identity": Must contain government-issued ID details like full name, ID number, 
+#           date of birth, and photo identification. Examples: National ID, Passport.
+#         - "Proof of Residence": Must show name and physical address. Examples: utility bill,affidavit form,
+#           bank statement, lease agreement (must be recent - within 3 months).
+#         - "Proof of Income": Must show income details like salary amounts, pay periods, employer info. 
+#           Examples: payslips, tax returns, bank statements showing salary deposits.
+#         - "Employment Letter": Must be on company letterhead, contain employment details 
+#           (position, start date, salary), and be signed by employer.
+#         - "Application Form": Must be a filled application form with personal and financial details.
+#         """
+        
+#         # Get verification from Mistral
+#         response = client.chat.complete(
+#             model="mistral-large-latest",
+#             messages=[{"role": "user", "content": prompt}],
+#             response_format={"type": "json_object"}
+#         )
+        
+#         # Parse JSON response
+#         verification = json.loads(response.choices[0].message.content)
+        
+#         # Validate response structure
+#         if not all(key in verification for key in ["verified", "confidence", "reason"]):
+#             raise ValueError("Invalid verification response format")
+            
+#         return verification
+        
+#     except Exception as e:
+#         return {
+#             "verified": False,
+#             "confidence": 0,
+#             "reason": f"Verification failed: {str(e)}"
+#         }
+
 def verify_document_category(category: str, markdown_content: str) -> dict:
-    """Verify if document content matches the specified category"""
+    """Verify if document content matches the specified category and suggest correct category"""
     try:
         # Truncate content to fit within token limits
         truncated_content = markdown_content[:15000]  # Keep first 15k characters
         
-        # Create verification prompt
+        # Create verification prompt with category suggestion
         prompt = f"""
-        You are a bank branch consultant responsible for verifying that the provided document 
-        matches the specified category. Analyze the document content and determine if it contains
+        You are a bank branch consultant responsible for document verification. Perform these tasks:
+        1. Analyze the document content and determine if it contains
         the required information for the category.
         
         Category: {category}
-        Document Content:
-        {truncated_content}
+        Document Content: {truncated_content}
+
+        2. Verify if the document matches the specified category: {category}
+        3. If it doesn't match, determine the correct category from: {", ".join(VALID_CATEGORIES)}
+        4. Provide a confidence score (0-100)
+        5. Explain your reasoning
+        6. if the document does not match the category, give the most appropriate reason for the mismatch and the reason must be consise and presentable to the client in a single to two sentences.
+        
         
         Your verification should be strict. Only return a JSON response with these keys:
         - "verified": boolean (true only if document clearly matches the category)
-        - "confidence": integer (0-100, confidence level in verification)
-        - "reason": string (brief explanation of your decision)
+        - "confidence": integer (0-100 confidence level)
+        - "reason": string (brief explanation)
+        - "correct_category": string (the most appropriate category)
+        - "initial_category": string (the provided category by the client: {category})
         
         Category Requirements:
-        - "Proof of Identity": Must contain government-issued ID details like full name, ID number, 
-          date of birth, and photo identification. Examples: National ID, Passport.
-        - "Proof of Residence": Must show name and physical address. Examples: utility bill,affidavit form,
-          bank statement, lease agreement (must be recent - within 3 months).
-        - "Proof of Income": Must show income details like salary amounts, pay periods, employer info. 
-          Examples: payslips, tax returns, bank statements showing salary deposits.
-        - "Employment Letter": Must be on company letterhead, contain employment details 
-          (position, start date, salary), and be signed by employer.
-        - "Application Form": Must be a filled application form with personal and financial details.
+        - "Proof of Identity": Government-issued ID with full name, ID number, date of birth, photo
+        - "Proof of Residence": Shows name and physical address (utility bill, bank statement, lease, affidavit)
+        - "Proof of Income": Shows income details (salary amounts, pay periods, employer info)
+        - "Employment Letter": Company letterhead with employment details, signed by employer
+        - "Application Form": Filled application form with personal/financial details
+        
+        Document Content:
+        {truncated_content}
         """
         
         # Get verification from Mistral
@@ -356,8 +429,13 @@ def verify_document_category(category: str, markdown_content: str) -> dict:
         verification = json.loads(response.choices[0].message.content)
         
         # Validate response structure
-        if not all(key in verification for key in ["verified", "confidence", "reason"]):
+        required_keys = ["verified", "confidence", "reason", "correct_category"]
+        if not all(key in verification for key in required_keys):
             raise ValueError("Invalid verification response format")
+            
+        # Ensure correct_category is valid
+        if verification["correct_category"] not in VALID_CATEGORIES:
+            verification["correct_category"] = category
             
         return verification
         
@@ -365,10 +443,11 @@ def verify_document_category(category: str, markdown_content: str) -> dict:
         return {
             "verified": False,
             "confidence": 0,
-            "reason": f"Verification failed: {str(e)}"
+            "reason": f"Verification failed: {str(e)}",
+            "correct_category": category
         }
-
-@app.post("/ocr")
+    
+@app.post("/api/v1/agents/ocr/verify-document")
 async def unified_ocr(
     category: str = Form(..., description="Document category for verification"),
     file: UploadFile = File(...)
@@ -410,8 +489,11 @@ async def unified_ocr(
         # Verify document category
         verification = verify_document_category(category, markdown_content)
         
+        # Determine the correct category to return
+        corrected_category = verification.get("correct_category", category)
+
         return JSONResponse(content={
-            "category": category,
+            "category": corrected_category,
             "filename": file.filename,
             "content_type": file.content_type,
             "ocr_type": "document" if file.content_type == "application/pdf" else "image",
@@ -426,7 +508,7 @@ async def unified_ocr(
         raise HTTPException(status_code=500, detail=str(e))
     
 # Separate endpoints for backward compatibility
-@app.post("/ocr/document")
+@app.post("/api/v1/agents/ocr/document")
 async def ocr_document(
     category: str = Form(..., description="Document category for verification"),
     file: UploadFile = File(...)
@@ -446,7 +528,7 @@ async def ocr_image(
         raise HTTPException(status_code=400, detail="Only JPEG/PNG images are supported")
     return await unified_ocr(category, file)
 
-@app.get("/documents/{file_id}")
+@app.get("/api/v1/agents/ocr/documents/{file_id}")
 async def get_document(
     file_id: str, 
     download: Optional[bool] = False
@@ -489,7 +571,7 @@ async def get_document(
             detail=f"Document not found or inaccessible: {str(e)}"
         )
 
-@app.get("/documents/{file_id}/info")
+@app.get("/api/v1/agents/ocr/documents/{file_id}/info")
 async def get_document_info(file_id: str):
     """
     Get metadata about a document stored on Mistral
@@ -531,7 +613,7 @@ async def get_document_info(file_id: str):
             detail=f"Document not found: {str(e)}"
         )
 
-@app.post("/upload-file")
+@app.post("/api/v1/agents/documents/upload-file")
 async def upload_file(
     file: UploadFile = File(..., description="File to upload (PDF, JPEG, PNG)")
 ):
@@ -602,7 +684,7 @@ async def upload_file(
             detail=f"File upload failed: {str(e)}"
         )
        
-@app.get("/file-view/{file_id}")
+@app.get("/api/v1/agents/documents/file-view/{file_id}")
 async def view_file(file_id: str):
     """
     View a file in the browser without downloading
@@ -640,6 +722,11 @@ async def view_file(file_id: str):
             status_code=404,
             detail=f"File access failed: {str(e)}"
         )
+
+
+@app.get("/api/v1/agents/health-check")
+def health_check():
+    return {"status": "active", "message": "automation-agents services are running"}
 
 if __name__ == "__main__":
     uvicorn.run("ocr_api:app", host="0.0.0.0", port=8000, reload=True)
