@@ -2,18 +2,20 @@
 python -m venv ocr_env
 python -m venv face_env
 # Activate environment
-cd ../..
+cd ..
 ocr-env\Scripts\activate.bat
 
-face_env\Scripts\activate
 # Install required packages
-pip install fastapi uvicorn python-multipart mistralai python-dotenv
-
+pip install -r requirements.txt
 pip freeze > requirements.txt
 
-pip install deepface opencv-python numpy python-multipart aiofiles
-
+# Run api
+cd automation-agents
 uvicorn ocr_api:app --reload
+To access the api docs: http://localhost:8000/docs
+
+# Run with ngrok
+pip install 
 ngrok http http://localhost:8000
 ngrok config check
 ngrok config edit

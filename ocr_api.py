@@ -2,6 +2,8 @@ from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.openapi.docs import get_swagger_ui_html
 from mistralai import Mistral
 import google.generativeai as genai
 import os
@@ -19,8 +21,35 @@ load_dotenv()
 app = FastAPI(
     title="Mistral OCR API",
     description="Unified API for document OCR, image OCR, and document verification",
-    version="3.0.0"
+    version="3.0.0",
+    contact={
+        "name": "API Support",
+        "email": "support@example.com",
+    },
+    license_info={
+        "name": "Apache 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
+    },
+    openapi_tags=[
+        {
+            "name": "OCR Processing",
+            "description": "Endpoints for document OCR and verification",
+        },
+        {
+            "name": "Document Management",
+            "description": "Endpoints for file upload and retrieval",
+        },
+        {
+            "name": "Data Extraction",
+            "description": "Endpoints for extracting structured data from documents",
+        },
+        {
+            "name": "System Health",
+            "description": "Service health monitoring",
+        },
+    ]
 )
+
 
 # Add CORS middleware
 app.add_middleware(
@@ -30,6 +59,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Custom OpenAPI schema
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    
+    # Add custom error responses
+    openapi_schema["components"]["schemas"]["HTTPError"] = {
+        "type": "object",
+        "properties": {
+            "detail": {"type": "string", "example": "Error details"}
+        }
+    }
+    
+    # Add security scheme
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT"
+        }
+    }
+    
+    # Add global security requirement
+    openapi_schema["security"] = [{"BearerAuth": []}]
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
 
 # Initialize Mistral client
 api_key = os.getenv("MISTRAL_API_KEY")
@@ -126,6 +193,14 @@ def extract_details_from_documents(documents: List[Dict[str, Any]]) -> Dict[str,
         4. FORMATTING:
            - All string values MUST BE IN UPPERCASE
            - Dates must be in YYYY-MM-DD format
+           - Zimbawean ID number must follow the format: XX-XXXXXXX [A-Z] XX or XX-XXXXXX [A-Z] XX
+            Example: 08-123456 D 53 or 08-1234567 D 53 or 02-100482 G 03
+            Components:
+            XX: Two digits representing the year of registration
+            XXXXXXX or XXXXXX: A serial number
+            [A-Z]: A single letter, possibly indicating the place of registration
+            XX: Two digits, possibly a check digit AA-AAAAAA A AA or AA-AAAAAA A AA  (12/13 digits), 
+            Sanitize the ID number to remove any spaces or special characters. For example, "08-123456 D 53" should be stored/returned as "08123456D53".
            - Numbers should be in numerical format (not words)
         5. MISSING DATA: Leave fields blank if information is not found in any document.
         6. STRUCTURE: Return ONLY a JSON object with the exact structure specified below.
@@ -225,7 +300,44 @@ def extract_details_from_documents(documents: List[Dict[str, Any]]) -> Dict[str,
     except Exception as e:
         raise RuntimeError(f"Extraction failed: {str(e)}")
 
-@app.post("/api/v1/agents/documents/extract-details")
+# @app.post("/api/v1/agents/documents/extract-details")
+@app.post(
+    "/api/v1/agents/documents/extract-details",
+    tags=["Data Extraction"],
+    summary="Extract structured data from OCR-processed documents",
+    description="""Processes OCR-processed documents through AI models to extract structured applicant information.
+    
+**Process Flow:**
+1. Accepts multiple OCR-processed documents
+2. Uses Google Gemini for data extraction
+3. Returns structured JSON with validated fields
+    
+**Data Validation Rules:**
+- All string values are UPPERCASE
+- Dates in YYYY-MM-DD format
+- ID numbers sanitized (remove spaces/dashes)
+- Strict extraction (only explicit values)
+    """,
+    response_description="Structured applicant details",
+    responses={
+        200: {
+            "description": "Successful extraction",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "personalDetails": {
+                            "countryOfBirth": "ZIMBABWE",
+                            "citizenship": "ZIMBABWEAN",
+                            # ... other fields ...
+                        }
+                    }
+                }
+            }
+        },
+        400: {"description": "Invalid request format"},
+        500: {"description": "Processing error"}
+    }
+)
 async def extract_details(
     documents: List[Dict[str, Any]] = Body(..., description="List of OCR-processed documents")
 ):
@@ -408,7 +520,7 @@ def verify_document_category(category: str, markdown_content: str) -> dict:
         - "initial_category": string (the provided category by the client: {category})
         
         Category Requirements:
-        - "Proof of Identity": Government-issued ID with full name, ID number, date of birth, photo
+        - "Proof of Identity": Government-issued ID with full name, ID number, date of birth
         - "Proof of Residence": Shows name and physical address (utility bill, bank statement, lease, affidavit)
         - "Proof of Income": Shows income details (salary amounts, pay periods, employer info)
         - "Employment Letter": Company letterhead with employment details, signed by employer
@@ -447,7 +559,55 @@ def verify_document_category(category: str, markdown_content: str) -> dict:
             "correct_category": category
         }
     
-@app.post("/api/v1/agents/ocr/verify-document")
+# @app.post("/api/v1/agents/ocr/verify-document")
+@app.post(
+    "/api/v1/agents/ocr/verify-document",
+    tags=["OCR Processing"],
+    summary="OCR processing with document verification",
+    description="""Processes documents/images through OCR and verifies document category.
+    
+**Features:**
+- PDF and image support (JPEG/PNG)
+- Automatic category verification
+- Content-based category correction
+- Returns cleaned markdown content
+    
+**Categories:** 
+- Proof of Identity
+- Proof of Residence
+- Proof of Income
+- Employment Letter
+- Application Form
+    """,
+    response_description="OCR results with verification status",
+    responses={
+        200: {
+            "description": "OCR processed successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "category": "Proof of Identity",
+                        "filename": "id_document.pdf",
+                        "content_type": "application/pdf",
+                        "ocr_type": "document",
+                        "pages": 1,
+                        "verification": {
+                            "verified": True,
+                            "confidence": 95,
+                            "reason": "Document contains required identity fields",
+                            "correct_category": "Proof of Identity"
+                        },
+                        "file_id": "file-abc123",
+                        "file_url": "https://signed.url/document",
+                        "view_url": "/file-view/file-abc123"
+                    }
+                }
+            }
+        },
+        400: {"description": "Invalid category or file type"},
+        500: {"description": "Processing error"}
+    }
+)
 async def unified_ocr(
     category: str = Form(..., description="Document category for verification"),
     file: UploadFile = File(...)
@@ -528,7 +688,26 @@ async def ocr_image(
         raise HTTPException(status_code=400, detail="Only JPEG/PNG images are supported")
     return await unified_ocr(category, file)
 
-@app.get("/api/v1/agents/ocr/documents/{file_id}")
+# @app.get("/api/v1/agents/ocr/documents/{file_id}")
+@app.get(
+    "/api/v1/agents/ocr/documents/{file_id}",
+    tags=["Document Management"],
+    summary="Retrieve stored document",
+    description="""Access document stored in Mistral system.
+    
+**Options:**
+- Redirect to signed URL (default)
+- Download content directly (with ?download=true)
+    """,
+    responses={
+        307: {"description": "Redirect to signed document URL"},
+        200: {
+            "description": "Document content when download=true",
+            "content": {"application/json": {}}
+        },
+        404: {"description": "Document not found"}
+    }
+)
 async def get_document(
     file_id: str, 
     download: Optional[bool] = False
@@ -571,7 +750,32 @@ async def get_document(
             detail=f"Document not found or inaccessible: {str(e)}"
         )
 
-@app.get("/api/v1/agents/ocr/documents/{file_id}/info")
+# @app.get("/api/v1/agents/ocr/documents/{file_id}/info")
+@app.get(
+    "/api/v1/agents/ocr/documents/{file_id}/info",
+    tags=["Document Management"],
+    summary="Get document metadata",
+    description="Retrieve metadata about stored document",
+    responses={
+        200: {
+            "description": "Document metadata",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "file_id": "file-abc123",
+                        "filename": "document.pdf",
+                        "purpose": "ocr",
+                        "created_at": "2023-10-05T12:30:45Z",
+                        "object": "file",
+                        "status_details": "processed",
+                        "size_bytes": 45678
+                    }
+                }
+            }
+        },
+        404: {"description": "Document not found"}
+    }
+)
 async def get_document_info(file_id: str):
     """
     Get metadata about a document stored on Mistral
@@ -613,7 +817,32 @@ async def get_document_info(file_id: str):
             detail=f"Document not found: {str(e)}"
         )
 
-@app.post("/api/v1/agents/documents/upload-file")
+# @app.post("/api/v1/agents/documents/upload-file")
+@app.post(
+    "/api/v1/agents/documents/upload-file",
+    tags=["Document Management"],
+    summary="Upload file to Mistral",
+    description="Store file in Mistral system and get access URLs",
+    response_description="File metadata and access URLs",
+    responses={
+        200: {
+            "description": "File uploaded successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "file_id": "file-xyz789",
+                        "file_url": "https://signed.url/file",
+                        "view_url": "/file-view/file-xyz789",
+                        "content_type": "image/png",
+                        "filename": "id_photo.png"
+                    }
+                }
+            }
+        },
+        400: {"description": "Invalid file type"},
+        500: {"description": "Upload failed"}
+    }
+)
 async def upload_file(
     file: UploadFile = File(..., description="File to upload (PDF, JPEG, PNG)")
 ):
@@ -684,7 +913,20 @@ async def upload_file(
             detail=f"File upload failed: {str(e)}"
         )
        
-@app.get("/api/v1/agents/documents/file-view/{file_id}")
+# @app.get("/api/v1/agents/documents/file-view/{file_id}")
+@app.get(
+    "/api/v1/agents/documents/file-view/{file_id}",
+    tags=["Document Management"],
+    summary="View file in browser",
+    description="Render document/image in browser with inline content-disposition",
+    responses={
+        200: {
+            "description": "File content",
+            "content": {"image/png": {}, "application/pdf": {}}
+        },
+        404: {"description": "File not found"}
+    }
+)
 async def view_file(file_id: str):
     """
     View a file in the browser without downloading
@@ -724,7 +966,27 @@ async def view_file(file_id: str):
         )
 
 
-@app.get("/api/v1/agents/health-check")
+# @app.get("/api/v1/agents/health-check")
+@app.get(
+    "/api/v1/agents/health-check",
+    tags=["System Health"],
+    summary="Service health check",
+    description="Verify API service availability",
+    response_description="Service status",
+    responses={
+        200: {
+            "description": "Service status",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "active", 
+                        "message": "services are running"
+                    }
+                }
+            }
+        }
+    }
+)
 def health_check():
     return {"status": "active", "message": "automation-agents services are running"}
 
